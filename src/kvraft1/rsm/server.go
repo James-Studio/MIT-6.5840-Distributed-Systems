@@ -89,7 +89,9 @@ func (rs *rsmSrv) Kill() {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 	//log.Printf("kill %d", rs.me)
-	//rs.rsm.Kill()
+	if rs.rsm != nil {
+		rs.rsm.Kill()
+	}
 	rs.rsm = nil
 }
 

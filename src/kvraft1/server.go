@@ -1,6 +1,8 @@
 package kvraft
 
 import (
+	"bytes"
+	"sync"
 	"sync/atomic"
 
 	"6.5840/kvraft1/rsm"
@@ -8,8 +10,12 @@ import (
 	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/tester1"
-
 )
+
+type KeyValue struct {
+	Value   string
+	Version rpc.Tversion
+}
 
 type KVServer struct {
 	me   int
@@ -17,6 +23,8 @@ type KVServer struct {
 	rsm  *rsm.RSM
 
 	// Your definitions here.
+	mu sync.Mutex
+	kv map[string]*KeyValue // key-value store
 }
 
 // To type-cast req to the right type, take a look at Go's type switches or type
@@ -25,29 +33,114 @@ type KVServer struct {
 // https://go.dev/tour/methods/16
 // https://go.dev/tour/methods/15
 func (kv *KVServer) DoOp(req any) any {
-	// Your code here
-	return nil
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	switch args := req.(type) {
+	case *rpc.GetArgs:
+		reply := &rpc.GetReply{}
+		if kvPair, exists := kv.kv[args.Key]; exists {
+			reply.Value = kvPair.Value
+			reply.Version = kvPair.Version
+			reply.Err = rpc.OK
+		} else {
+			reply.Err = rpc.ErrNoKey
+		}
+		return reply
+
+	case *rpc.PutArgs:
+		reply := &rpc.PutReply{}
+		
+		if kvPair, exists := kv.kv[args.Key]; exists {
+			if kvPair.Version != args.Version {
+				reply.Err = rpc.ErrVersion
+				return reply
+			}
+			kvPair.Value = args.Value
+			kvPair.Version++
+			reply.Err = rpc.OK
+		} else {
+			if args.Version != 0 {
+				reply.Err = rpc.ErrNoKey
+				return reply
+			}
+			kv.kv[args.Key] = &KeyValue{
+				Value:   args.Value,
+				Version: 1,
+			}
+			reply.Err = rpc.OK
+		}
+		return reply
+
+	default:
+		return nil
+	}
 }
 
 func (kv *KVServer) Snapshot() []byte {
-	// Your code here
-	return nil
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.kv)
+	return w.Bytes()
 }
 
 func (kv *KVServer) Restore(data []byte) {
-	// Your code here
+	if data == nil || len(data) < 1 {
+		return
+	}
+
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var kvMap map[string]*KeyValue
+	if d.Decode(&kvMap) != nil {
+		kv.kv = make(map[string]*KeyValue)
+	} else {
+		kv.kv = kvMap
+	}
 }
 
 func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {
 	// Your code here. Use kv.rsm.Submit() to submit args
 	// You can use go's type casts to turn the any return value
 	// of Submit() into a GetReply: rep.(rpc.GetReply)
+	err, result := kv.rsm.Submit(args)
+	if err != rpc.OK {
+		reply.Err = err
+		return
+	}
+	
+	getReply, ok := result.(*rpc.GetReply)
+	if !ok {
+		reply.Err = rpc.ErrWrongLeader
+		return
+	}
+	
+	*reply = *getReply
 }
 
 func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
 	// Your code here. Use kv.rsm.Submit() to submit args
 	// You can use go's type casts to turn the any return value
 	// of Submit() into a PutReply: rep.(rpc.PutReply)
+	err, result := kv.rsm.Submit(args)
+	if err != rpc.OK {
+		reply.Err = err
+		return
+	}
+	
+	putReply, ok := result.(*rpc.PutReply)
+	if !ok {
+		reply.Err = rpc.ErrWrongLeader
+		return
+	}
+	
+	*reply = *putReply
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -61,6 +154,7 @@ func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
 func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	// Your code here, if desired.
+	kv.rsm.Kill()
 }
 
 func (kv *KVServer) killed() bool {
@@ -74,11 +168,20 @@ func StartKVServer(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, persist
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(rsm.Op{})
-	labgob.Register(rpc.PutArgs{})
-	labgob.Register(rpc.GetArgs{})
+	labgob.Register(&rpc.PutArgs{})
+	labgob.Register(&rpc.GetArgs{})
+	labgob.Register(&rpc.GetReply{})
+	labgob.Register(&rpc.PutReply{})
 
-	kv := &KVServer{me: me}
+	kv := &KVServer{
+		me: me,
+		kv: make(map[string]*KeyValue),
+	}
 
+	snapshot := persister.ReadSnapshot()
+	if snapshot != nil && len(snapshot) > 0 {
+		kv.Restore(snapshot)
+	}
 
 	kv.rsm = rsm.MakeRSM(servers, me, persister, maxraftstate, kv)
 	// You may need initialization code here.
